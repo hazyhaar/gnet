@@ -1,0 +1,179 @@
+name: Gnet qualification (does not claim Codecov gate green)
+
+# Temporary addition to hazyhaar/gnet only; leave upstream workflows intact.
+# No CODECOV_TOKEN is available: coverage is retained, not submitted to Codecov.
+on:
+  push:
+    branches:
+      - 'qualification/gnet-766-*'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GO111MODULE: 'on'
+  GOPROXY: https://proxy.golang.org
+
+jobs:
+  lint:
+    name: Lint / ${{ matrix.os }}
+    if: github.repository == 'hazyhaar/gnet'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout exact push SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.20'
+          cache: false
+      - name: Run upstream lint with explicit timeout
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.12.2
+          args: -v -E gocritic -E misspell -E revive -E godot --timeout 5m
+      - name: Run upstream poll variant lint arguments
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.12.2
+          args: -v -E gocritic -E misspell -E revive -E godot
+      - name: Additionally lint poll_opt sources
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.12.2
+          args: -v -E gocritic -E misspell -E revive -E godot --build-tags=poll_opt --timeout 5m
+
+  native:
+    name: Native / ${{ matrix.go }} / ${{ matrix.os }} / ${{ matrix.variant }} (coverage artifact only)
+    if: github.repository == 'hazyhaar/gnet'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.20', '1.26']
+        os: [ubuntu-latest, macos-14, windows-latest]
+        variant: [default, gc_opt, poll_opt, 'poll_opt,gc_opt']
+        exclude:
+          - {os: windows-latest, variant: gc_opt}
+          - {os: windows-latest, variant: poll_opt}
+          - {os: windows-latest, variant: 'poll_opt,gc_opt'}
+        include:
+          - {variant: default, race: '-race', tags: '', test-timeout: 15m}
+          - {variant: gc_opt, race: '-race', tags: '-tags=gc_opt', test-timeout: 15m}
+          - {variant: poll_opt, race: '', tags: '-tags=poll_opt', test-timeout: 10m}
+          - {variant: 'poll_opt,gc_opt', race: '', tags: '-tags=poll_opt,gc_opt', test-timeout: 10m}
+    steps:
+      - name: Checkout exact push SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Prepare test log directory
+        run: mkdir -p qualification-logs
+      - name: Run upstream package tests (root excluded)
+        run: |
+          set -euo pipefail
+          package_list="$(go list ./... | tail -n +2)"
+          test -n "$package_list"
+          packages=()
+          while IFS= read -r package; do
+            packages+=("$package")
+          done <<< "$package_list"
+          go test -json "${packages[@]}" 2>&1 | tee qualification-logs/packages.log
+      - name: Additionally exercise the tagged poller with race detection
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          go test -json -race ${{ matrix.tags }} -timeout 5m ./pkg/netpoll 2>&1 | tee qualification-logs/poller-variant.log
+      # windows-latest supplies native toolchain dependencies, including race support.
+      # Preserve the sole upstream race exception: Windows with Go 1.26.
+      - name: Run upstream root integration tests
+        run: |
+          set -euo pipefail
+          go test -json -v ${{ !(runner.os == 'Windows' && startsWith(matrix.go, '1.26')) && matrix.race || '' }} ${{ matrix.tags }} -coverprofile="codecov.report" -covermode=atomic -timeout ${{ matrix.test-timeout }} -failfast 2>&1 | tee qualification-logs/integration.log
+      - name: Always retain full test logs and available coverage (not a Codecov gate)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.os }}-go${{ matrix.go }}-${{ matrix.variant }}-${{ github.sha }}
+          path: |
+            qualification-logs/
+            codecov.report
+          if-no-files-found: error
+
+  crossbuild:
+    name: BSD crossbuild / Go ${{ matrix.go }}
+    if: github.repository == 'hazyhaar/gnet'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.20', '1.25']
+    steps:
+      - name: Checkout exact push SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Cross-compile DragonFlyBSD
+        run: GOOS=dragonfly GOARCH=amd64 go build
+      - name: Cross-compile DragonFlyBSD with tags
+        run: GOOS=dragonfly GOARCH=amd64 go build -tags=poll_opt,gc_opt
+      - name: Cross-compile FreeBSD
+        run: GOOS=freebsd GOARCH=amd64 go build
+      - name: Cross-compile FreeBSD with tags
+        run: GOOS=freebsd GOARCH=amd64 go build -tags=poll_opt,gc_opt
+      - name: Cross-compile NetBSD
+        run: GOOS=netbsd GOARCH=amd64 go build
+      - name: Cross-compile NetBSD with tags
+        run: GOOS=netbsd GOARCH=amd64 go build -tags=poll_opt,gc_opt
+      - name: Cross-compile OpenBSD
+        run: GOOS=openbsd GOARCH=amd64 go build
+      - name: Cross-compile OpenBSD with tags
+        run: GOOS=openbsd GOARCH=amd64 go build -tags=poll_opt,gc_opt
+
+  codeql:
+    name: CodeQL
+    if: github.repository == 'hazyhaar/gnet'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout exact push SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: go
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
