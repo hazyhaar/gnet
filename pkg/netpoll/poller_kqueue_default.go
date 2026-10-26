@@ -20,7 +20,6 @@ import (
 	"errors"
 	"os"
 	"runtime"
-	"sync"
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
@@ -32,12 +31,10 @@ import (
 
 // Poller represents a poller which is in charge of monitoring file-descriptors.
 type Poller struct {
+	pollerLifecycle
 	fd                          int
 	pipe                        []int
 	wakeupCall                  int32
-	retireMu                    sync.RWMutex         // orders Trigger admission against retire
-	stopped                     bool                 // set by retire; Trigger fails afterwards, guarded by retireMu
-	done                        chan struct{}        // closed by retire, once
 	asyncTaskQueue              queue.AsyncTaskQueue // queue with low priority
 	urgentAsyncTaskQueue        queue.AsyncTaskQueue // queue with high priority
 	highPriorityEventsThreshold int32                // threshold of high-priority events
@@ -46,6 +43,7 @@ type Poller struct {
 // OpenPoller instantiates a poller.
 func OpenPoller() (poller *Poller, err error) {
 	poller = new(Poller)
+	poller.fd = -1
 	poller.done = make(chan struct{})
 	if poller.fd, err = unix.Kqueue(); err != nil {
 		poller = nil
@@ -64,13 +62,18 @@ func OpenPoller() (poller *Poller, err error) {
 	return
 }
 
-// Close closes the poller.
+// Close closes a retired or not-yet-started poller, or returns EBUSY while Polling runs.
 func (p *Poller) Close() error {
-	if len(p.pipe) == 2 {
-		_ = unix.Close(p.pipe[0])
-		_ = unix.Close(p.pipe[1])
-	}
-	return os.NewSyscallError("close", unix.Close(p.fd))
+	return p.closePoller(func() error {
+		var pipeErr error
+		if len(p.pipe) == 2 {
+			pipeErr = errors.Join(unix.Close(p.pipe[0]), unix.Close(p.pipe[1]))
+		}
+		if p.fd >= 0 {
+			return errors.Join(pipeErr, os.NewSyscallError("close kqueue", unix.Close(p.fd)))
+		}
+		return pipeErr
+	})
 }
 
 // Trigger enqueues task and wakes up the poller to process pending tasks.
@@ -80,11 +83,16 @@ func (p *Poller) Close() error {
 //
 // Note that asyncTaskQueue is a queue of low-priority whose size may grow large and tasks in it may backlog.
 func (p *Poller) Trigger(priority queue.EventPriority, fn queue.Func, param any) (err error) {
+	p.retireMu.Lock()
+	defer p.retireMu.Unlock()
 	if err = p.enqueue(priority, fn, param); err != nil {
 		return
 	}
 	if atomic.CompareAndSwapInt32(&p.wakeupCall, 0, 1) {
 		err = p.wakePoller()
+		if err != nil {
+			atomic.StoreInt32(&p.wakeupCall, 0)
+		}
 	}
 	return os.NewSyscallError("kevent | write", err)
 }
@@ -92,6 +100,9 @@ func (p *Poller) Trigger(priority queue.EventPriority, fn queue.Func, param any)
 // Polling blocks the current goroutine, monitoring the registered file descriptors and waiting for network I/O.
 // When I/O occurs on any of the file descriptors, the provided callback function is invoked.
 func (p *Poller) Polling(callback PollEventHandler) error {
+	if err := p.beginPolling(); err != nil {
+		return err
+	}
 	defer p.retire()
 	el := newEventList(InitPollEventsCap)
 
@@ -114,7 +125,7 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 
 		for i := 0; i < n; i++ {
 			ev := &el.events[i]
-			if fd := int(ev.Ident); fd == 0 { // poller is awakened to run tasks in queues
+			if fd := int(ev.Ident); p.isWakeupEvent(fd, ev.Filter) { // poller is awakened to run tasks in queues
 				doChores = true
 				p.drainWakeupEvent()
 			} else {

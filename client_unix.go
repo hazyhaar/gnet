@@ -292,17 +292,9 @@ func (cli *Client) EnrollContext(c net.Conn, ctx any) (Conn, error) {
 	gc.SetContext(ctx)
 	gc.SetSafeContext(ctx)
 
-	connOpened := make(chan struct{})
-	ccb := &connWithCallback{c: gc, cb: func() {
-		close(connOpened)
-	}}
-	err = el.poller.Trigger(queue.HighPriority, el.register, ccb)
-	if err != nil {
+	dupFD = -1 // registerConn owns and resolves every outcome from here.
+	if err = el.registerConn(gc, queue.HighPriority); err != nil {
 		return nil, err
 	}
-	if !awaitPollerRegister(connOpened, el.poller.Done()) {
-		return nil, errorx.ErrEngineShutdown
-	}
-	dupFD = -1 // register owns gc.fd from here
 	return gc, nil
 }
